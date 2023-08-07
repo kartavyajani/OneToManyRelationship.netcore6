@@ -1,0 +1,103 @@
+
+DBContext:
+builder.Entity<Child>(x =>
+            {
+                x.HasIndex(s => new { s.parentId }).IsUnique(false);
+                x.HasOne<Parent>(s => s.parent)
+                      .WithMany(g => g.children)
+                      .HasForeignKey(s => s.parentId)
+                      .OnDelete(DeleteBehavior.NoAction);
+            });
+
+API:
+[HttpPost("test-parent")]
+    public async Task<object> PostTestParent(Parent _parent)
+    {
+        var parent = new Parent();
+        parent.age = 101;
+        parent.contact = "9619516969";
+        parent.parentName = "Pitaji";
+        var child = new Child();
+        child.childName = "Betaji";
+        parent.children = new List<Child> { { child } };
+
+        // var resp = await _ngDBcontext.parents.AddAsync(_parent);
+        // await _ngDBcontext.SaveChangesAsync();
+        Console.WriteLine(parent);
+        Console.WriteLine(child);
+        return _parent;
+    }
+
+//parent model---------------------------
+using System;
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+using System.Linq;
+using System.Threading.Tasks;
+
+namespace ScorecardEngine.Domain.Entities.Models.RnD
+{
+    [Table("tbl_parent")]
+    public class Parent
+    {
+        [Key]
+        [Column("id")]
+        public int id { get; set; }
+        [Column("parent_name")]
+        public string? parentName { get; set; }
+        [Column("age")]
+        public int? age { get; set; }
+        [Column("contact", TypeName = "varchar(10)")]
+        public string? contact { get; set; }
+
+        public List<Child>? children { get; set; }
+
+        public override bool Equals(object? obj)
+        {
+            return base.Equals(obj);
+        }
+
+        public override int GetHashCode()
+        {
+            return base.GetHashCode();
+        }
+
+        public override string? ToString()
+        {
+           return $"Parent {{ id = {id}, parentName = {parentName}, age = {age}, contact = {contact}, Children = {children} }}";
+        }
+    }
+}
+//child model---------------
+
+namespace ScorecardEngine.Domain.Entities.Models.RnD
+{
+    [Table("tbl_child")]
+    public class Child
+    {
+        [Key]
+        [Column("id")]
+        public int id { get; set; }
+        [Column("child_name")]
+        public string? childName { get; set; }
+        [Column("parent_id")]
+        public int parentId { get; set; }
+        public Parent? parent ;
+
+        public override bool Equals(object? obj)
+        {
+            return base.Equals(obj);
+        }
+
+        public override int GetHashCode()
+        {
+            return base.GetHashCode();
+        }
+
+        public override string? ToString()
+        {
+            return $"Child {{ Id = {id}, ChildName = {childName}, ParentId = {parentId} }}";
+        }
+    }
+}
