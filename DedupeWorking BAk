@@ -1,0 +1,2058 @@
+using System.Reflection;
+using System.Reflection.Metadata;
+using System.Net;
+using Dedupe.Configuration;
+using Dedupe.GlobalMsgs;
+using Dedupe.Models;
+using Dedupe.Services;
+using Microsoft.EntityFrameworkCore;
+using MongoDB.Bson;
+using MongoDB.Driver;
+using Newtonsoft.Json;
+using Nucsoft.AdvancedSuite.Dedupe.Data;
+using Nucsoft.AdvancedSuite.Dedupe.Interfaces;
+using Nucsoft.AdvancedSuite.Dedupe.Pagination;
+using Nucsoft.AdvancedSuite.Dedupe.Utils;
+
+using System;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
+using System.Threading.Tasks;
+using Microsoft.EntityFrameworkCore.Storage;
+using Newtonsoft.Json.Linq;
+using System.Net.Http.Headers;
+
+using Microsoft.AspNetCore.Mvc;
+
+using System.Text.RegularExpressions;
+
+using Microsoft.AspNetCore.Mvc;
+using Nucsoft.AdvanceSuite.BuildingBlocks.Utilities;
+using Nucsoft.AdvanceSuite.BuildingBlocks.DTOs;
+using System.Collections;
+using ClosedXML.Excel;
+using System.Net.Http;
+using System.Text;
+using dedupe.Models;
+using System.Globalization;
+using Microsoft.Data.SqlClient;
+
+namespace Nucsoft.AdvancedSuite.Dedupe.Services
+{
+    public class DedupeRepo : IDedupeRepo
+    {
+        private readonly NgDBcontext _context;
+        private readonly IMongoDatabaseContext _mongoDatabaseContext;
+        private readonly Message _message;
+        private readonly Utilities _utilities;
+        private readonly IMongoCollection<BsonDocument> _applicationCollection;
+
+        private readonly NoSQLUtilities _noSQLUtilities;
+        private readonly HttpClient _httpClient;
+
+        public DedupeRepo(
+            HttpClient httpClient,
+            NgDBcontext context,
+            IMongoDatabaseContext mongoDatabaseContext,
+            Utilities utilities,
+            Message message,
+            NoSQLUtilities noSQLUtilities
+        )
+        {
+            _utilities = utilities;
+            _context = context;
+            _noSQLUtilities = noSQLUtilities;
+            _mongoDatabaseContext = mongoDatabaseContext;
+            _message = message;
+            _httpClient = httpClient;
+            _httpClient.BaseAddress = new Uri("https://localhost:7186/");
+            _applicationCollection = _mongoDatabaseContext.Database.GetCollection<BsonDocument>(
+                "loan_applications"
+            );
+        }
+
+        //-------------------
+        public async Task<object> getDedupe(int appId, bool isRetriggerEnabled)
+        {
+            List<string> dedupeParameterList = await getDedupeParameterforcode();
+            // List<string> dedupeParameterList = new List<string>();
+            //dedupeParameterList.Add("business_pan");
+            //dedupeParameterList.Add("personal_pan");
+            //   dedupeParameterList.Add("is_primary_applicant");
+            //  dedupeParameterList.Add("gst_exemption_notification_number");
+            string currentDedupeParamterString = string.Join(",", dedupeParameterList);
+
+            dedupeParameterList.Add("application_id");
+           // dedupeParameterList.Add("first_name_applicant");
+            var noSQLFetchForpersonal_detailsCheck = new NoSQLFetchDTO
+            {
+                multipleFetchType = "array",
+                productCompositionId = 1,
+                moduleKey = "application_form",
+                fieldUniverseKeys = dedupeParameterList,
+                matchConditions = new List<MatchConditionDto>(),
+                groupConditions = new List<GroupOperationDto>()
+            };
+            bool containsPersonalDetails = false;
+            using (var httpClient = new HttpClient())
+            {
+                // Set the base URL of your API endpoint
+                httpClient.BaseAddress = new Uri("https://localhost:7186/");
+                var jsonPayload = System.Text.Json.JsonSerializer.Serialize(
+                    noSQLFetchForpersonal_detailsCheck
+                );
+
+                // Create a StringContent with the JSON payload
+                var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
+
+                // Set the appropriate headers
+                content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+
+                // Make the POST request and get the response
+                var response1 = await _httpClient.PostAsync("key-paths-for-module", content);
+
+                // Check if the request was successful
+                if (response1.IsSuccessStatusCode)
+                {
+                    // Read the response content
+                    var responseContent = await response1.Content.ReadAsStringAsync();
+                    var sections = System.Text.Json.JsonSerializer.Deserialize<List<SectionDto>>(
+                        responseContent
+                    );
+                    containsPersonalDetails = sections.Any(
+                        section => section.sectionKey == "personal_details_of_applicant"
+                    );
+                    if (containsPersonalDetails)
+                    {
+                        // Set the boolean variable to true
+                        // Do something with it
+                    }
+                    // Handle the response content as needed
+                    Console.WriteLine(responseContent);
+                }
+                else
+                {
+                    // Handle the case where the request was not successful
+                    Console.WriteLine($"Request failed with status code: {response1.StatusCode}");
+                }
+            }
+
+            NoSQLFetchDTO noSQLFetchDTOForChannelandRbi = new NoSQLFetchDTO
+            {
+                multipleFetchType = "array",
+                productCompositionId = 1,
+                moduleKey = "application_form",
+                // "permanant_details_number"
+                fieldUniverseKeys = new List<string>
+                {
+                    "business_pan",
+                    "personal_pan",
+                    "application_id"
+                },
+                matchConditions = new List<MatchConditionDto>
+                {
+                    new MatchConditionDto
+                    {
+                        logicalOperator = "and", // Set your logical operator here if needed
+                        matchOperations = new List<MatchOperationDto>
+                        {
+                            new MatchOperationDto
+                            {
+                                fieldUniverseKey = "application_id",
+                                operation = "$eq",
+                                value = appId
+                            }
+                        }
+                    }
+                },
+                groupConditions = new List<GroupOperationDto>()
+            };
+            // noSQLFetchDTO.fieldUniverseKeys.Add("business_pan");
+            // noSQLFetchDTO.fieldUniverseKeys.Add("personal_pan");
+
+            var applicationDataForChannelanRbi =
+                await _noSQLUtilities.fetchNoSQLDataAsBsonDocsAsync(
+                    _applicationCollection,
+                    noSQLFetchDTOForChannelandRbi
+                );
+            if (applicationDataForChannelanRbi == null)
+            {
+                return HttpStatusCode.NotAcceptable;
+            }
+
+            NoSQLFetchDTO noSQLFetchDTO = new NoSQLFetchDTO
+            {
+                multipleFetchType = "array",
+                productCompositionId = 1,
+                moduleKey = "application_form",
+                fieldUniverseKeys = dedupeParameterList,
+                matchConditions = new List<MatchConditionDto>
+                {
+                    new MatchConditionDto
+                    {
+                        logicalOperator = "and", // Set your logical operator here if needed
+                        matchOperations = new List<MatchOperationDto>
+                        {
+                            new MatchOperationDto
+                            {
+                                fieldUniverseKey = "application_id",
+                                operation = "$eq",
+                                value = appId
+                            }
+                        }
+                    }
+                },
+                groupConditions = new List<GroupOperationDto>()
+            };
+            // noSQLFetchDTO.fieldUniverseKeys.Add("business_pan");
+            // noSQLFetchDTO.fieldUniverseKeys.Add("personal_pan");
+
+            var applicationData = await _noSQLUtilities.fetchNoSQLDataAsBsonDocsAsync(
+                _applicationCollection,
+                noSQLFetchDTO
+            );
+            if (applicationData.Count == 0)
+            {
+                return HttpStatusCode.NotAcceptable;
+            }
+            //System.Console.WriteLine("applicant applicationData first anme------->"+applicationData[0]["first_name_applicant"].AsBsonArray);
+
+            HashSet<string> personalPanFields = new HashSet<string>(
+                dedupeParameterList.Where(x => x.Contains("personal_pan"))
+            );
+
+            System.Console.WriteLine("application data json obejct ---------->" + applicationData);
+
+            NoSQLFetchDTO noSQLFetchDTOForDedupe = new NoSQLFetchDTO
+            {
+                multipleFetchType = "array",
+                productCompositionId = 1,
+                moduleKey = "application_form",
+                fieldUniverseKeys = new List<string>(),
+                matchConditions = new List<MatchConditionDto>(),
+                groupConditions = new List<GroupOperationDto>()
+            };
+
+            noSQLFetchDTOForDedupe.fieldUniverseKeys.Add("first_name_applicant");
+            // noSQLFetchDTOForDedupe.fieldUniverseKeys.Add("applicant_middle_name");
+            // noSQLFetchDTOForDedupe.fieldUniverseKeys.Add("applicant_last_name");
+            noSQLFetchDTOForDedupe.fieldUniverseKeys.Add("name_of_the_entity");
+            noSQLFetchDTOForDedupe.fieldUniverseKeys.Add("is_primary_applicant");
+
+            MatchConditionDto matchCondition = new MatchConditionDto
+            {
+                logicalOperator = "or",
+                matchOperations = new List<MatchOperationDto>()
+            };
+            foreach (var item in applicationData)
+            {
+                Console.WriteLine("Application:");
+                foreach (var kvp in item)
+                {
+                    // Console.WriteLine($"{kvp.Name}: {kvp.Value}");
+
+
+                    noSQLFetchDTOForDedupe.fieldUniverseKeys.Add(kvp.Name);
+
+                    System.Console.WriteLine("key---------->" + kvp.Name);
+
+                    if (kvp.Name != "application_id" && kvp.Name != "is_primary_applicant")
+                    {
+                        if (kvp.Value is IEnumerable enumerable && !(kvp.Value is string))
+                        {
+                            var arrayValues = new List<string>();
+                            foreach (var item1 in enumerable)
+                            {
+                                arrayValues.Add(item1.ToString());
+                            }
+
+                            matchCondition.matchOperations.Add(
+                                new MatchOperationDto
+                                {
+                                    fieldUniverseKey = kvp.Name,
+                                    operation = "$in",
+                                    value = arrayValues
+                                }
+                            );
+                            System.Console.WriteLine("inside if var --->" + arrayValues);
+                        }
+                        else
+                        {
+                            System.Console.WriteLine("inside else var --->" + kvp.Value.ToString());
+                            matchCondition.matchOperations.Add(
+                                new MatchOperationDto
+                                {
+                                    fieldUniverseKey = kvp.Name,
+                                    operation = "$eq",
+                                    value = kvp.Value.ToString()
+                                }
+                            );
+                        }
+                    }
+                }
+                Console.WriteLine();
+            }
+
+            noSQLFetchDTOForDedupe.matchConditions.Add(matchCondition);
+            Console.WriteLine("noSQLFetchDTOForDedupe" + noSQLFetchDTOForDedupe);
+            //             var jsonData = applicationData[0].toString();
+
+            // // Parse the JSON string to a JObject
+            // var applicationDataJsonObject = JObject.Parse(jsonData);
+            var dedupeList = await _noSQLUtilities.fetchNoSQLDataAsBsonDocsAsync(
+                _applicationCollection,
+                noSQLFetchDTOForDedupe
+            );
+        System.Console.WriteLine("applicant first anme------->"+dedupeList[0]["first_name_applicant"].AsBsonArray);
+
+            List<BsonDocument> dedupeResultList = dedupeList;
+            // return respApplicationDetailsDedupe;
+            List<string> matchedFields = new List<string>();
+            var dedupeResultForApplication1 = new Dictionary<object, object>();
+            var dedupeResultForApplication = new List<Dictionary<string, object>>();
+            System.Console.WriteLine("deduperesult list------->" + dedupeResultList);
+            //                 int index=0;
+
+            foreach (var dedupeApplication in dedupeResultList)
+            {
+                var listOfMatchedParam = new List<string>();
+
+                var dedupeResponseList = new Dictionary<string, object>();
+
+                if (dedupeApplication["application_id"] != appId)
+                {
+                    //System.Console.WriteLine("dedupeJsonObject---------->" + dedupeJsonObject);
+                    System.Console.WriteLine(
+                        "processing app id: " + dedupeApplication["application_id"]
+                    );
+                    bool isPersonalDetailsPresent = false;
+                    List<String> matchedDedupeParamter = new List<string>();
+                    List<String> macthedWithValuesList = new List<String>();
+                    foreach (var dedupeParam in dedupeParameterList)
+                    {
+                        var dedupeTokens = dedupeApplication[dedupeParam];
+                        var applicationTokens = applicationData[0][dedupeParam];
+
+                        System.Console.WriteLine("application token::" + applicationTokens);
+                        if (
+                            dedupeTokens is BsonArray dedupeArray
+                            && applicationTokens is BsonArray applicationArray
+                        )
+                        {
+                            int indexapp = 0;
+                            foreach (var dedupeElement in dedupeArray)
+                            {
+                                foreach (var applicationElement in applicationArray)
+                                {
+                                    System.Console.WriteLine(
+                                        "application element::" + applicationElement
+                                    );
+                                    if (dedupeElement == applicationElement)
+                                    {
+                                        if (!listOfMatchedParam.Contains(dedupeParam))
+                                        {
+                                            System.Console.WriteLine(
+                                                "inside matched parameter " + dedupeParam
+                                            );
+                                            System.Console.WriteLine(
+                                                "dedupe element---->"
+                                                    + dedupeElement
+                                                    + "aaa::"
+                                                    + applicationElement
+                                            );
+                                            listOfMatchedParam.Add(dedupeParam);
+                                            matchedDedupeParamter.Add(dedupeParam);
+                                            var data = dedupeApplication[dedupeParam];
+                                            string matchedvalueWithData =
+                                                (string)applicationElement;
+
+                                            macthedWithValuesList.Add(matchedvalueWithData);
+
+                                            if (containsPersonalDetails)
+                                            {
+                                                System.Console.WriteLine("setting to true ");
+                                                isPersonalDetailsPresent = true;
+                                            }
+                                        }
+                                    }
+                                    indexapp++;
+                                }
+                            }
+                        }
+                        else if (dedupeTokens == applicationTokens)
+                        {
+                            if (!listOfMatchedParam.Contains(dedupeParam))
+                            {
+                                System.Console.WriteLine("inside matched parameter " + dedupeParam);
+                                listOfMatchedParam.Add(dedupeParam);
+
+                                matchedDedupeParamter.Add(dedupeParam);
+                                var data = dedupeApplication[dedupeParam];
+                                string matchedvalueWithData = (string)data;
+
+                                macthedWithValuesList.Add(matchedvalueWithData);
+
+                                System.Console.WriteLine("setting to true ");
+                                isPersonalDetailsPresent = false;
+                            }
+                        }
+                    }
+
+                    string matchedDedupeParamString = string.Join(",", matchedDedupeParamter);
+                    System.Console.WriteLine(
+                        "matched dedupe parameter string ------->" + matchedDedupeParamString
+                    );
+                    string matchedDedupeStringWithValues = string.Join(",", macthedWithValuesList);
+
+                    //var matchedFields = string.Join(",", listOfMatchedParam);
+
+                    System.Console.WriteLine(
+                        "matched field with values ----->"
+                            + matchedDedupeStringWithValues
+                            + " "
+                            + dedupeApplication["application_id"]
+                    );
+                    // listOfMatchedParam.Clear();
+                    var isPrimaryApplicantList = dedupeApplication[
+                        "is_primary_applicant"
+                    ].AsBsonArray;
+                    var companyName = dedupeApplication["name_of_the_entity"].AsString;
+                    var applicantFirstNames = dedupeApplication["first_name_applicant"].AsBsonArray;
+                    System.Console.WriteLine("applicatn first name"+applicantFirstNames);
+                    if (containsPersonalDetails)
+                    {
+                        if (
+                            dedupeApplication.Contains("personal_pan")
+                            && dedupeApplication["personal_pan"].BsonType == BsonType.Array
+                        )
+                        {
+                            var personalDetailsArray = dedupeApplication[
+                                "personal_pan"
+                            ].AsBsonArray;
+                            var applicationDataPersonalDetailsArray = applicationData[0][
+                                "personal_pan"
+                            ].AsBsonArray;
+
+                            for (int i = 0; i < personalDetailsArray.Count; i++)
+                            {
+                                var matchedApplicantNames = new List<string>();
+                                //var personalDetailsToken = personalDetailsArray[i];
+
+                                var firstName = applicantFirstNames[i].ToString();
+
+                                var isPrimaryApplicant = isPrimaryApplicantList[i].ToBoolean();
+                                System.Console.WriteLine(
+                                    "primary applicant value---------->" + isPrimaryApplicant
+                                );
+                                var primaryApplicantName = "";
+
+                                Console.WriteLine("Primary applicant name--->" + firstName);
+
+                                if (firstName != null && !string.IsNullOrEmpty(firstName))
+                                {
+                                    foreach (var field in personalPanFields)
+                                    {
+                                        var personalPanToken = personalDetailsArray[i].AsString;
+                                        System.Console.WriteLine(
+                                            "personalPanToken: " + personalPanToken
+                                        );
+
+                                        for (
+                                            int j = 0;
+                                            j < applicationDataPersonalDetailsArray.Count;
+                                            j++
+                                        )
+                                        {
+                                            var applicationPersonalPanToken =
+                                                applicationDataPersonalDetailsArray[j].AsString;
+                                            System.Console.WriteLine(
+                                                "comparing both pans here----->"
+                                                    + "personalPanToken-->"
+                                                    + personalPanToken
+                                                    + " applicationPersonalPanToken-->"
+                                                    + applicationPersonalPanToken
+                                                    + "-->"
+                                                    + dedupeApplication["application_id"]
+                                            );
+
+                                            if (
+                                                personalPanToken != null
+                                                && applicationPersonalPanToken != null
+                                                && personalPanToken.ToString()
+                                                    == applicationPersonalPanToken.ToString()
+                                            )
+                                            {
+                                                System.Console.WriteLine(
+                                                    "inside adding "
+                                                        + firstName
+                                                        + "---->"
+                                                        + dedupeApplication["application_id"]
+                                                );
+                                                if (!matchedApplicantNames.Contains(firstName)) // check if name is already present in the list
+                                                {
+                                                    matchedApplicantNames.Add(firstName);
+                                                    System.Console.WriteLine(
+                                                        "inside matching first name ifff---->"
+                                                            + firstName
+                                                    );
+                                                    System.Console.WriteLine(
+                                                        "matchedDedupeParamString---->"
+                                                            + matchedDedupeParamString
+                                                    );
+                                                    var dedupeResponseListRespInnner =
+                                                        new Dictionary<string, object>
+                                                        {
+                                                            { "requested_id", appId },
+                                                            {
+                                                                "application_id",
+                                                                dedupeApplication["application_id"]
+                                                            },
+                                                            { "company_name", companyName! },
+                                                            { "applicant_name", firstName },
+                                                            {
+                                                                "dedupe_paramter",
+                                                                currentDedupeParamterString
+                                                            },
+                                                            {
+                                                                "matched_feilds",
+                                                                matchedDedupeStringWithValues
+                                                            },
+                                                            {
+                                                                "listofmatchhedfiels",
+                                                                macthedWithValuesList
+                                                            },
+                                                            {
+                                                                "listofmatchhedfiels1",
+                                                                listOfMatchedParam
+                                                            }
+                                                            //{ "match_customer_id", dedupeApplication["customer_id"].ToInt32() },
+                                                            // { "requested_customer_id",applicationData["customer_id"].ToInt32()},
+                                                        };
+
+                                                    dedupeResultForApplication.Add(
+                                                        dedupeResponseListRespInnner
+                                                    );
+                                                }
+                                            }
+                                            else
+                                                System.Console.WriteLine(
+                                                    "primary app: "
+                                                        + isPrimaryApplicant
+                                                        + "---->"
+                                                        + isPersonalDetailsPresent
+                                                );
+                                            if (
+                                                isPrimaryApplicant.Equals(true)
+                                                && !matchedApplicantNames.Contains(firstName)
+                                                && isPersonalDetailsPresent == false
+                                            )
+                                            {
+                                                System.Console.WriteLine(
+                                                    "inside matching first name---->" + firstName
+                                                );
+                                                matchedApplicantNames.Add(firstName);
+                                                var dedupeResponseListResp = new Dictionary<
+                                                    string,
+                                                    object
+                                                >
+                                                {
+                                                    { "requested_id", appId },
+                                                    {
+                                                        "application_id",
+                                                        dedupeApplication[
+                                                            "application_id"
+                                                        ].ToInt32()
+                                                    },
+                                                    { "company_name", companyName! },
+                                                    { "applicant_name", firstName },
+                                                    {
+                                                        "dedupe_paramter",
+                                                        currentDedupeParamterString
+                                                    },
+                                                    {
+                                                        "matched_feilds",
+                                                        matchedDedupeStringWithValues
+                                                    },
+                                                    {
+                                                        "listofmatchhedfiels",
+                                                        macthedWithValuesList
+                                                    },
+                                                    { "listofmatchhedfiels1", listOfMatchedParam }
+                                                    // { "match_customer_id", dedupeApplication["customer_id"].ToInt32() },
+                                                    //  { "requested_customer_id",applicationData["customer_id"].ToInt32()},
+                                                };
+
+                                                dedupeResultForApplication.Add(
+                                                    dedupeResponseListResp
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                var applicantNames = string.Join(",", matchedApplicantNames);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        var matchedApplicantNames1 = new List<string>();
+                        bool isPrimaryApplicant = false;
+                        String firstName = String.Empty;
+
+                        for (int i = 0; i < isPrimaryApplicantList.Count; i++)
+                        {
+                            //var personalDetailsToken = personalDetailsArray[i];
+
+
+
+                            if (isPrimaryApplicantList[i].ToBoolean() == true)
+                            {
+                                firstName = applicantFirstNames[i].ToString();
+                                isPrimaryApplicant = true;
+                            }
+                        }
+                        if (
+                            isPrimaryApplicant.Equals(true)
+                            && !matchedApplicantNames1.Contains(firstName)
+                            && !isPersonalDetailsPresent
+                        )
+                        {
+                            System.Console.WriteLine("inside matching first name---->" + firstName);
+                            matchedApplicantNames1.Add(firstName);
+                            var dedupeResponseListResp = new Dictionary<string, object>
+                            {
+                                { "requested_id", appId },
+                                { "application_id", dedupeApplication["application_id"].ToInt32() },
+                                { "company_name", companyName! },
+                                { "applicant_name", firstName },
+                                { "dedupe_paramter", currentDedupeParamterString },
+                                { "matched_feilds", matchedDedupeStringWithValues },
+                                { "listofmatchhedfiels", macthedWithValuesList },
+                                { "listofmatchhedfiels1", listOfMatchedParam }
+                                // { "match_customer_id", dedupeApplication["customer_id"].ToInt32() },
+                                //  { "requested_customer_id",applicationData["customer_id"].ToInt32()},
+                            };
+
+                            dedupeResultForApplication.Add(dedupeResponseListResp);
+                        }
+                    }
+                }
+            }
+
+            //dedupeResultForApplication1.Add("demo",dedupeResultList);
+
+
+            //#endregion prepare_result_to_add_in_the_application
+            // var permanant_details_number = applicationDataForChannelanRbi[0]["permanant_details_number"].AsBsonArray;
+            var business_pan = applicationDataForChannelanRbi[0]["business_pan"].AsString;
+            var personal_pan = applicationDataForChannelanRbi[0]["personal_pan"].AsBsonArray;
+            List<string> personalPansList = new List<string>();
+            List<string> permanentNumberList = new List<string>();
+            List<string> businessPanList = new List<string>();
+            businessPanList.Add(business_pan);
+
+            foreach (var token in permanentNumberList) //permanant_details_number
+            {
+                System.Console.WriteLine("permanentNumber -----> rbi" + token);
+                permanentNumberList.Add(token);
+            }
+
+            foreach (var token in personal_pan)
+            {
+                System.Console.WriteLine("personal pan -----> rbi" + token);
+                personalPansList.Add(token.ToString());
+            }
+            var dedupeRequestData = new Dictionary<string, object>();
+            foreach (var dedupeParam in dedupeParameterList)
+            {
+                dedupeRequestData.Add(dedupeParam, applicationData[0][dedupeParam]);
+            }
+
+            var rejectionData = await findIfChannelRejected(businessPanList, permanentNumberList);
+            var rbiRejection = await findIfRBIRejected(personalPansList);
+
+            #region update_data_to_application
+            var _applicationCollectionDedupe =
+                _mongoDatabaseContext.Database.GetCollection<BsonDocument>("Dedupe");
+            var filter = Builders<BsonDocument>.Filter.Eq("application_id", appId);
+            DedupeDto dedupeDataDto = new DedupeDto();
+            dedupeDataDto.request_id = Guid.NewGuid().ToString();
+            dedupeDataDto.dedupe_params = dedupeParameterList;
+            dedupeDataDto.dedupe_request_data = dedupeRequestData;
+
+            var matchedApplications = new List<MatchedApplicationDto>();
+            var matchedRbirejection = new List<MatchedRbiRejectionDto>();
+
+            foreach (var kvp in dedupeResultForApplication)
+            {
+                var matchedApplication = new MatchedApplicationDto
+                {
+                    requested_application_id = (int)kvp["requested_id"],
+                    matched_application_id = kvp["application_id"].ToString(),
+                    contact_name = kvp["applicant_name"].ToString(),
+                    matched_fields = (List<string>)kvp["listofmatchhedfiels1"],
+                    matched_field_values = (List<string>)kvp["listofmatchhedfiels"],
+                    company_name = kvp["company_name"].ToString(),
+                    //Remark = kvp["Remark"].ToString(),
+                    // IsNoMatchFound = kvp["IsNoMatchFound"].ToString()
+                    reason_of_rejection = "NA",
+                    current_stage = "Pre loan disbursed ",
+                    restructured = "No",
+                    lbal = "0",
+                    pbal = "0",
+                    dpd_dash = "0",
+                    // requested_customer_id = (int)kvp["requested_customer_id"],
+                    // match_customer_id = (int)kvp["match_customer_id"],
+                    remark = null,
+                    is_no_match_found = false,
+                    updated_by = null,
+                    created_date = new DateTime(),
+                };
+
+                matchedApplications.Add(matchedApplication);
+            }
+            System.Console.WriteLine("rbi reject ion from dedupe::::::::::" + rbiRejection);
+            foreach (var dedupenegative in rbiRejection)
+            {
+                System.Console.WriteLine("deduenegative----->" + dedupenegative);
+            }
+            // foreach (var dedupenegative in rbiRejection)
+            // {
+            //     System.Console.WriteLine("inside dedupe negative:::::"+dedupenegative);
+            //     var matcedRejectionDto = new MatchedRbiRejectionDto
+            //     {
+            //         matched_rbi_rejection = dedupenegative.id,
+            //         sr_no = dedupenegative.srNo.GetValueOrDefault(),
+            //         date_caution_advice = dedupenegative.dateCautionAdvice,
+            //         date_of_receipt_caution_advice = dedupenegative.dateofReceiptCautionAdvice,
+            //         caution_advice_no = dedupenegative.cautionAdviceNo,
+            //         name_of_proprietary = dedupenegative.nameofPerpetrators,
+            //         pan = dedupenegative.pan,
+            //         nature_of_rbi_caution = dedupenegative.natureofRBICaution,
+            //         added_on = dedupenegative.addedOn.ToString(),
+            //         docs_file_id = dedupenegative.docsfileid.GetValueOrDefault(),
+            //         s3_bucket_file_path = dedupenegative.s3BucketFilePath,
+            //         filename = dedupenegative.fileName
+            //     };
+            //     System.Console.WriteLine("matched rbi rejection stoo---l." + matcedRejectionDto);
+
+            //     matchedRbirejection.Add(matcedRejectionDto);
+            // }
+
+
+            // set the matchedApplications list to the MatchedApplication property of matchedData
+            var matchedData = new MatchedDataDto
+            {
+                matched_application = matchedApplications,
+                matched_rbi_rejection = rbiRejection,
+                matched_channel_rejection = rejectionData
+            };
+
+            // set the matchedData instance to the MatchedData property of dedupeDataDto
+            dedupeDataDto.matched_data = matchedData;
+            var existingDocument = _applicationCollectionDedupe.Find(filter).FirstOrDefault();
+            // currentDedupe=new Dictionary<string, object>();
+            System.Console.WriteLine();
+            //  var currentDedupe = new BsonDocument();
+
+            if (
+                existingDocument != null
+                && isRetriggerEnabled == true
+                && existingDocument.Contains("Dedupe")
+            )
+            {
+                // Update the existing document
+                var currentDedupe = existingDocument.GetValue("Dedupe").AsBsonArray;
+                System.Console.WriteLine("currentDedupe.Count ---------->" + currentDedupe.Count);
+
+                // Append the new value to the Dedupe array
+                currentDedupe.Add(BsonDocument.Parse(JsonConvert.SerializeObject(dedupeDataDto)));
+                // foreach (var item in dedupeResultForApplication)
+                // {
+                //     currentDedupe.Add(new BsonDocument(item));
+                // }
+
+                // Update the existing document
+                var update = Builders<BsonDocument>.Update.Set("Dedupe", currentDedupe);
+                //.AddToSet("ChannelRejectionData", new BsonArray(System.Text.Json.JsonSerializer.Serialize(rejectionData)))
+                //.AddToSet("RBIRejectionList", new BsonArray(System.Text.Json.JsonSerializer.Serialize(rbiRejection)));
+
+                var updateResult = _applicationCollectionDedupe.UpdateOne(filter, update);
+                // Check updateResult to m ake sure the update was successful
+            }
+            else
+            {
+                System.Console.WriteLine("dedupe Data dto:::::----->" + dedupeDataDto);
+                if (
+                    isRetriggerEnabled == false && existingDocument == null
+                    || (existingDocument != null && !existingDocument.Contains("Dedupe"))
+                )
+                {
+                    // Insert a new document
+                    var newDocument = new BsonDocument
+                    {
+                        { "application_id", appId },
+                        {
+                            "Dedupe",
+                            new BsonArray(
+                                new[]
+                                {
+                                    BsonDocument.Parse(JsonConvert.SerializeObject(dedupeDataDto))
+                                }
+                            )
+                        },
+                        //{"ChannelRejectionData", new BsonArray(System.Text.Json.JsonSerializer.Serialize(rejectionData))},
+                        // {"RBIRejectionList", new BsonArray(System.Text.Json.JsonSerializer.Serialize(rbiRejection))}
+                    };
+
+                    _applicationCollectionDedupe.InsertOne(newDocument);
+                }
+            }
+            #endregion update_data_to_application
+
+            //await dedupeAudit(appId, count, isRetriggre);
+            #region prepare_response
+            var response = new Dictionary<string, object>();
+
+            //  response.Add("ChannelRejectionData", rejectionData);
+            response.Add("Dedupe", dedupeDataDto);
+            //response.Add("originalvalue", dedupeResultForApplication);
+            //   response.Add("RBIRejectionList", rbiRejection);
+            #endregion prepare_response
+
+            return JsonConvert.SerializeObject(response);
+
+            {
+                throw new Exception(_message.triggerError);
+            }
+        }
+
+        public async Task<List<BsonDocument>> fetchApplicationByParam(
+            Dictionary<string, List<dynamic>> searchParameterList
+        )
+        {
+            var filterBuilder = Builders<BsonDocument>.Filter;
+            var filterList = new List<FilterDefinition<BsonDocument>>();
+
+            foreach (KeyValuePair<string, List<dynamic>> entry in searchParameterList)
+            {
+                if (entry.Value.Count == 1)
+                {
+                    System.Console.WriteLine("inside if --->");
+                    // If there is only one value for the key, use an equality filter.
+                    filterList.Add(filterBuilder.Eq(entry.Key, entry.Value[0]));
+                }
+                else
+                {
+                    System.Console.WriteLine("inside else--->");
+                    // If there are multiple values for the key, use an "in" filter.
+                    filterList.Add(filterBuilder.In(entry.Key, entry.Value));
+                }
+
+                System.Console.WriteLine(
+                    "entry data=====================>" + entry.Key + entry.Value[0]
+                );
+            }
+
+            var filter = filterBuilder.Or(filterList);
+            var result = await _applicationCollection.Find(filter).ToListAsync();
+
+            System.Console.WriteLine("Number of matches found: " + result.Count);
+
+            return result.ToList();
+        }
+
+        // public async Task<List<BsonDocument>> fetchApplicationByParam(Dictionary<string, object> searchParameterList)
+        // {
+        //     var filterBuilder = Builders<BsonDocument>.Filter;
+        //     var filterList = new List<FilterDefinition<BsonDocument>>();
+
+        //     foreach (KeyValuePair<string, object> entry in searchParameterList)
+        //     {
+        //         filterList.Add(filterBuilder.Eq(entry.Key, entry.Value.ToString()));
+
+        //         System.Console.WriteLine("entry data=====================>" + entry.Key + entry.Value);
+        //     }
+
+        //     var filter = filterBuilder.And(filterList);
+        //     var result = await _applicationCollection.Find(filter).ToListAsync();
+
+        //     return result;
+        // }
+        // public async Task<List<BsonDocument>> fetchApplicationByParam(Dictionary<string, object> serachParameterList)
+        // {
+
+        //     System.Console.WriteLine("fetchApplicationByParam method param: " + serachParameterList);
+        //     var filterBuilder = Builders<BsonDocument>.Filter;
+        //     var filterList = new List<FilterDefinition<BsonDocument>>();
+
+        //     foreach (KeyValuePair<string, object> entry in serachParameterList)
+        //     {
+        //         filterList.Add(filterBuilder.Eq(entry.Key, entry.Value.ToString()));
+
+        //         System.Console.WriteLine("entry data=====================>" + entry.Key + entry.Value);
+        //     }
+        //     var dedupeFilter = filterBuilder.Or(filterList);
+        //     var dedupeResult = _applicationCollection.Find(dedupeFilter);
+        //     return dedupeResult.ToList();
+        // }
+
+        // public async Task<int> dedupeRequest(int appId)
+        // {
+        //     var dedupeRequestModel = new DedupeRequestModel
+        //     {
+        //         applicationId = appId,
+        //         companyName = "Nucsoft",
+        //         messageId = "New Message",
+        //         userId = new Guid(),
+        //         description = "Test",
+        //         version = 0,
+        //         status = "p"
+        //     };
+
+        //     await _context.AddAsync(dedupeRequestModel);
+        //     await _context.SaveChangesAsync();
+        //     return dedupeRequestModel.id;
+        // }
+
+        // public async Task<object> logDedupeRequestDetails(Dictionary<string, object> payload, int requestData)
+        // {
+        //     var model = new DedupeRequestDetailsModel
+        //     {
+        //         description = "Test",
+        //         dedupeRequestId = requestData,
+        //         version = 1,
+        //         dedupeRequestData = System.Text.Json.JsonSerializer.Serialize(payload)
+        //     };
+
+        //     _context.dedupeRequestDetails.Add(model);
+        //     await _context.SaveChangesAsync();
+        //     return model;
+
+        // }
+        public async Task<object> getByID(int appId)
+        {
+            var _applicationCollectionDedupe =
+                _mongoDatabaseContext.Database.GetCollection<BsonDocument>("Dedupe");
+            if (_applicationCollectionDedupe == null)
+            {
+                return HttpStatusCode.NotAcceptable;
+            }
+
+            var applicationFilter = Builders<BsonDocument>.Filter.Eq("application_id", appId);
+            var applicationData = _applicationCollectionDedupe
+                .Find(applicationFilter)
+                .FirstOrDefault();
+
+            if (applicationData == null)
+            {
+                // Handle not found scenario
+                return HttpStatusCode.NotFound;
+            }
+
+            applicationData.Remove("_id");
+            var jsonData = applicationData.ToJson();
+
+            // Parse the JSON string to a JObject
+            var applicationDataJsonObject = JObject.Parse(jsonData);
+
+            var dedupeArray = applicationDataJsonObject.GetValue("Dedupe")?.ToObject<JArray>();
+            var lastDedupeObject = dedupeArray.LastOrDefault()?.ToObject<JObject>();
+            string authorizedBy = lastDedupeObject?.GetValue("authorized_by")?.ToString();
+            System.Console.WriteLine("autorized by--------->" + authorizedBy);
+            if (!string.IsNullOrEmpty(authorizedBy))
+            {
+                System.Console.WriteLine("inside string check_______----->" + authorizedBy);
+                // Perform the query to fetch user_name from mst_user
+
+                
+    //             var query =  $@"SELECT m.user_name FROM mst_user m WHERE m.user_id = {authorizedBy}";
+    //             // var parameters = new { userId = authorizedBy };
+    //  var resp = await _context.userIdDtos
+    //             .FromSqlRaw(query)
+    //             .ToListAsync();
+                    var query = @"SELECT m.user_name FROM mst_user m WHERE m.user_id = @userId";
+    var parameters = new SqlParameter("@userId", authorizedBy);
+    
+    var resp = await _context.userIdDtos
+        .FromSqlRaw(query, parameters)
+        .ToListAsync();
+
+                if (resp != null && resp.Count > 0)
+                {
+                    var userName = resp[0].user_name;
+
+                    // Append the user_name to the JSON data
+                 applicationDataJsonObject["Dedupe"][dedupeArray.Count - 1]["authorized_by"] = userName;
+                }
+            }
+
+            return applicationDataJsonObject.ToString();
+
+            // return jsonData;
+        }
+
+        //         public async Task<object> getByID(int appId)
+        //         {
+        //   var _applicationCollectionDedupe = _mongoDatabaseContext.Database.GetCollection<BsonDocument>("Dummy");
+        //             var filter = Builders<BsonDocument>.Filter.Eq("application_id", appId);
+        //             var result = await _applicationCollectionDedupe.Find(filter).ToListAsync();
+
+        //             List<Dictionary<string, object>> dictionaryList = new List<Dictionary<string, object>>();
+        //             foreach (BsonDocument bsonDocument in result)
+        //             {
+        //                 Dictionary<string, object> dictionary = new Dictionary<string, object>();
+        //                 foreach (BsonElement element in bsonDocument.Elements)
+        //                 {
+        //                     if (element.Value is BsonDocument)
+        //                     {
+        //                         BsonDocument nestedDocument = (BsonDocument)element.Value;
+        //                         Dictionary<string, object> nestedDictionary = new Dictionary<string, object>();
+        //                         foreach (BsonElement nestedElement in nestedDocument.Elements)
+        //                         {
+        //                             nestedDictionary.Add(nestedElement.Name, nestedElement.Value);
+        //                         }
+        //                         dictionary.Add(element.Name, nestedDictionary);
+        //                     }
+        //                     else if (element.Value is BsonArray)
+        //                     {
+        //                         BsonArray bsonArray = (BsonArray)element.Value;
+        //                         List<Dictionary<string, object>> nestedList = new List<Dictionary<string, object>>();
+        //                         foreach (BsonValue bsonValue in bsonArray)
+        //                         {
+        //                             if (bsonValue is BsonDocument)
+        //                             {
+        //                                 BsonDocument nestedDocument = (BsonDocument)bsonValue;
+        //                                 Dictionary<string, object> nestedDictionary = new Dictionary<string, object>();
+        //                                 foreach (BsonElement nestedElement in nestedDocument.Elements)
+        //                                 {
+        //                                     nestedDictionary.Add(nestedElement.Name, nestedElement.Value);
+        //                                 }
+        //                                 nestedList.Add(nestedDictionary);
+        //                             }
+        //                         }
+        //                         dictionary.Add(element.Name, nestedList);
+        //                     }
+        //                     else
+        //                     {
+        //                         dictionary.Add(element.Name, element.Value);
+        //                     }
+        //                 }
+        //                 dictionaryList.Add(dictionary);
+        //             }
+        //             string json = JsonConvert.SerializeObject(dictionaryList);
+        //             return json;
+
+        //         }
+
+
+        //     public async Task<object> verifyData(int appId, Dictionary<string, string> payload)
+        //     {
+
+        // var _applicationCollectionDedupe = _mongoDatabaseContext.Database.GetCollection<BsonDocument>("Dummy");
+        //         var updates = Builders<BsonDocument>.Update;
+        //         var combinedUpdate = updates.Combine(payload.Select(field => updates.Set(field.Key, field.Value)));
+        //         // await dedupeAudit(appId, 2, "true");
+        //         await _applicationCollectionDedupe.UpdateOneAsync(Builders<BsonDocument>.Filter.Eq("application_id", appId), combinedUpdate);
+        //         return _message.verify;
+        //     }
+
+        public async Task<object> verifyData(int appId, List<DedupeDto> dedupeDataDtoList)
+        {
+            var _applicationCollectionDedupe =
+                _mongoDatabaseContext.Database.GetCollection<BsonDocument>("Dedupe");
+            if (_applicationCollectionDedupe == null)
+            {
+                return HttpStatusCode.NotAcceptable;
+            }
+
+            var filter = Builders<BsonDocument>.Filter.Eq("application_id", appId);
+            var existingDocument = await _applicationCollectionDedupe
+                .Find(filter)
+                .FirstOrDefaultAsync();
+
+            if (existingDocument != null && existingDocument.Contains("Dedupe"))
+            {
+                var currentDedupe = existingDocument["Dedupe"].AsBsonArray;
+
+                foreach (var dedupeDataDto in dedupeDataDtoList)
+                {
+                    // Find the existing item in the list by RequestId and update it
+                    var existingItem = currentDedupe.FirstOrDefault(
+                        d => d["request_id"] == dedupeDataDto.request_id
+                    );
+                    if (existingItem != null)
+                    {
+                        var index = currentDedupe.IndexOf(existingItem);
+                        currentDedupe[index] = BsonDocument.Parse(
+                            JsonConvert.SerializeObject(dedupeDataDto)
+                        );
+                    }
+                    else
+                    {
+                        currentDedupe.Add(
+                            BsonDocument.Parse(JsonConvert.SerializeObject(dedupeDataDto))
+                        );
+                    }
+                }
+
+                var update = Builders<BsonDocument>.Update.Set("Dedupe", currentDedupe);
+                var updateResult = await _applicationCollectionDedupe.UpdateOneAsync(
+                    filter,
+                    update
+                );
+
+                if (updateResult.ModifiedCount > 0)
+                {
+                    return "Document updated successfully.";
+                }
+                else
+                {
+                    return "Failed to update document.";
+                }
+            }
+            else
+            {
+                return "Document not found or does not contain Dedupe field.";
+            }
+        }
+
+        // public async Task<object> dedupeAudit(int id, int triggerCount, string isRetrigger)
+        // {
+        //     var dedupeData = new DedupeDataModel
+        //     {
+        //         applicationID = id,
+        //         userId = new Guid(),
+        //         description = "Test",
+        //         version = 1,
+        //         isNoMatchfound = true,
+        //         triggerCount = triggerCount,
+        //         isRetriggerEnabled = true,
+        //         isRetriggered = isRetrigger == "True",
+        //         reTriggeredBy = new Guid(),
+        //         lastTriggeredDate = DateTime.Now,
+        //         remark = "1020306050",
+        //         isApprove = true,
+        //         isFunded = true
+        //     };
+
+        //     await _context.AddAsync(dedupeData);
+        //     await _context.SaveChangesAsync();
+        //     return dedupeData;
+        // }
+
+        public async Task<List<MatchedChannelRejectionDto>> findIfChannelRejected(
+            List<String> business_pan,
+            List<String> personalNumber
+        )
+        {
+            var dedupeRepositoryData = await (
+                from repositoryData in _context.dedupeRepositoryData
+                where
+                    business_pan.Contains(repositoryData.applicantPan)
+                    || personalNumber.Contains(repositoryData.mobileNumber)
+                select new MatchedChannelRejectionDto
+                {
+                    matched_channel_rejection_id = repositoryData.dedupe_repository_data_id,
+                    mobile_number = repositoryData.mobileNumber,
+                    entity_type = repositoryData.entityType,
+                    business_pan = repositoryData.businessPan,
+                    company_name = repositoryData.companyName,
+                    applicant_name = repositoryData.applicantName,
+                    business_address = repositoryData.businessAddress,
+                    source_type = repositoryData.sourceType,
+                    lead_source = repositoryData.leadSource,
+                    sub_source = repositoryData.subSource,
+                    reject_reason = repositoryData.rejectReason,
+                    rejected_date = repositoryData.rejectedDate,
+                    applicant_pan = repositoryData.applicantPan,
+                    cibil_download_url = repositoryData.cibilDownlaodUrl,
+                    control_program = repositoryData.controlProgram,
+                }
+            ).ToListAsync();
+
+            System.Console.WriteLine(
+                "dedupe reopistory count ----->" + dedupeRepositoryData.Count()
+            );
+            System.Console.WriteLine("dedupe reopistory  ----->" + dedupeRepositoryData);
+
+            return dedupeRepositoryData;
+        }
+
+        public async Task<List<MatchedRbiRejectionDto>> findIfRBIRejected(List<string> personal_pan)
+        {
+            System.Console.WriteLine("inside RBI negative----->" + personal_pan[1]);
+            var dedupeRepositoryData = await (
+                from DedupeNegativeList in _context.dedupeNegativeList
+                where personal_pan.Contains(DedupeNegativeList.pan)
+                select new MatchedRbiRejectionDto
+                {
+                    matched_rbi_rejection = DedupeNegativeList.dedupe_negative_list_id,
+                    id = DedupeNegativeList.id,
+                    date_caution_advice = DedupeNegativeList.dateCautionAdvice,
+                    date_of_receipt_caution_advice = DedupeNegativeList.dateofReceiptCautionAdvice,
+                    caution_advice_no = DedupeNegativeList.cautionAdviceNo,
+                    name_of_proprietary = DedupeNegativeList.nameofPerpetrators,
+                    pan = DedupeNegativeList.pan,
+                    nature_of_rbi_caution = DedupeNegativeList.natureofRBICaution,
+                    docs_file_id = DedupeNegativeList.docsfileid.GetValueOrDefault(),
+                    s3_bucket_file_path = DedupeNegativeList.s3BucketFilePath,
+                    filename = DedupeNegativeList.fileName
+                }
+            ).ToListAsync();
+
+            System.Console.WriteLine(
+                "inside dedupeRepositoryData RBI negative---->" + dedupeRepositoryData
+            );
+            return dedupeRepositoryData;
+        }
+
+        public async Task<object> externalDedupeParamGet()
+        {
+            List<string> json = await getDedupeParameterforcode();
+            string panCardJson = "[\"pan_card\"]";
+            string channel_rejection_param = "[\"pan_card\",\"mobile_number\"]";
+
+            var panCardJsonList = JsonConvert.DeserializeObject<string[]>(panCardJson);
+            var Channelrejction = JsonConvert.DeserializeObject<string[]>(channel_rejection_param);
+            var dedupeData = new Dictionary<string, object>();
+            //dedupeData.Add("dedupeField", json!);
+            dedupeData.Add("rbi_rejection_param", panCardJsonList!);
+            dedupeData.Add("channel_rejection_param", Channelrejction!);
+
+            return dedupeData;
+        }
+
+        public async Task<object> externalDedupeParamSave(Dictionary<string, object> payload)
+        {
+            Console.WriteLine("payload: " + payload);
+            // var result = await fetchApplicationByParam(payload);
+            // return result.convertBsonToDcitonary();
+            return null;
+        }
+
+        // public List<string> getDedupeParam()
+        // {
+        //     var dedupeParameterList = (from parameter in _context.dedupeParameter
+        //                                join field in _context.fieldUniverses on
+        //                                parameter.fieldUniverseId equals field.fieldUniverseId
+        //                                where parameter.active == true
+        //                               && field.isApplicableForDedupe == true
+        //                                select field.fieldName)
+        //     .Distinct()
+        //     .ToList();
+
+        //     return dedupeParameterList;
+        // }
+
+        // public async Task<object> getUniverseParameter()
+        // {
+
+        //     System.Console.WriteLine("inside repo universalParameter===============");
+        //     var universeParameter = await (from parameter in _context.fieldUniverses
+        //                                    where parameter.isApplicableForDedupe == true
+        //                                    select new
+        //                                    {
+        //                                        parameter.fieldUniverseId,
+        //                                        parameter.fieldName,
+        //                                    }).ToListAsync();
+        //     System.Console.WriteLine("universalParameter===============" + universeParameter);
+        //     return universeParameter;
+        // }
+
+        // public async Task<object> getDedupeParameter()
+        // {
+        //     var dedupeParameter = await (from parameter in _context.dedupeParameter
+        //                                  join field in _context.fieldUniverses on
+        //                                  parameter.fieldUniverseId equals field.fieldUniverseId
+        //                                  where parameter.active == true
+        //                                 && field.isApplicableForDedupe == true
+        //                                  select new
+        //                                  {
+        //                                      parameter.dedupeParameterId,
+        //                                      field.fieldName,
+        //                                      fieldId = field.fieldUniverseId,
+        //                                      parameter.fromDate,
+        //                                      parameter.toDate
+
+        //                                  }).ToListAsync();
+
+        //     return dedupeParameter;
+        // }
+        // public async Task<List<DedupeParamterDTO>> getDedupeParameterAll()
+        // {
+        //     var dedupeParameter = await (from parameter in _context.dedupeParameter
+        //                                  join field in _context.fieldUniverses on
+        //                                  parameter.fieldUniverseId equals field.fieldUniverseId
+        //                                  where parameter.active == true
+        //                                      && field.isApplicableForDedupe == true
+        //                                  select new DedupeParamterDTO
+        //                                  {
+        //                                      dedupeParameterId = parameter.dedupeParameterId,
+        //                                      fieldName = field.fieldName,
+        //                                      fieldUniverseId = field.fieldUniverseId
+        //                                  }).ToListAsync();
+
+
+
+        //     return dedupeParameter;
+        // }
+        public async Task<object> saveDedupeParameter(
+            FieldUniverseConfigModel fieldUniverseConfigModel
+        )
+        {
+            // Set the default values for BaseEntity properties
+            fieldUniverseConfigModel.isActive = true;
+            fieldUniverseConfigModel.isDeleted = false;
+            fieldUniverseConfigModel.createdBy = Guid.NewGuid();
+            fieldUniverseConfigModel.createdDate = DateTime.Now;
+
+            // Add the FieldUniverseConfigModel to the appropriate context and save changes
+            _context.fieldUniverseConfigModels.Add(fieldUniverseConfigModel);
+            await _context.SaveChangesAsync();
+
+            return fieldUniverseConfigModel;
+        }
+
+        public async Task<object> updateDedupeParameters(
+            FieldUniverseConfigModel fieldUniverseConfigModel
+        )
+        {
+            var parameterId = fieldUniverseConfigModel.FieldUniverseConfigId;
+            var parameter = await _context.fieldUniverseConfigModels.FirstOrDefaultAsync(
+                p => p.FieldUniverseConfigId == parameterId
+            );
+            System.Console.WriteLine("field universe config model----->" + parameter);
+            if (parameter != null)
+            {
+                parameter.description = fieldUniverseConfigModel.description;
+                parameter.FieldUniverseId = fieldUniverseConfigModel.FieldUniverseId;
+                parameter.isActive = fieldUniverseConfigModel.isActive;
+                parameter.isDeleted = fieldUniverseConfigModel.isDeleted;
+                parameter.sequence = fieldUniverseConfigModel.sequence;
+                parameter.Threshold = fieldUniverseConfigModel.Threshold;
+                parameter.updatedBy = fieldUniverseConfigModel.updatedBy;
+                parameter.updatedDate = fieldUniverseConfigModel.updatedDate;
+                parameter.version = fieldUniverseConfigModel.version;
+                parameter.fromDate = DateTime.Now;
+                parameter.toDate = DateTime.Now;
+
+                await _context.SaveChangesAsync();
+                return parameter;
+            }
+
+            return null; // or handle the case when the parameter is not found
+        }
+
+        public async Task<object> saveDedupeParameterConfigAudit(
+            DedupeConfigAudit dedupeConfigAudit
+        )
+        {
+            var entity = new DedupeConfigAudit
+            {
+                description = "Testing",
+                changedParameter = dedupeConfigAudit.changedParameter,
+                updatedParameter = dedupeConfigAudit.updatedParameter,
+                previousParameter = dedupeConfigAudit.previousParameter,
+                isActive = dedupeConfigAudit.isActive,
+                createdDate = DateTime.Now,
+                isDeleted = dedupeConfigAudit.isDeleted,
+                sequence = dedupeConfigAudit.sequence,
+                updatedBy = dedupeConfigAudit.updatedBy,
+                updatedDate = DateTime.Now,
+                // uuid = dedupeConfigAudit.uuid,
+                version = 0,
+            };
+
+            _context.dedupeConfigAudit.Add(entity);
+            await _context.SaveChangesAsync();
+
+            return entity;
+        }
+
+        public async Task<PagedResponse<List<DedupeConfigAudit>>> getAllDedupeParamAudit(
+            PaginationFilter paginationFilter
+        )
+        {
+            var pageRespDic = _utilities.generateForPageURL(
+                paginationFilter.PageNumber,
+                paginationFilter.PageSize,
+                paginationFilter.applicationPath
+            );
+            var resp = await (
+                from dedupeAudit in _context.dedupeConfigAudit
+                orderby dedupeAudit.dedupeDataId descending
+                select dedupeAudit
+            )
+                .Skip((paginationFilter.PageNumber - 1) * paginationFilter.PageSize)
+                .Take(paginationFilter.PageSize)
+                .ToListAsync();
+            // var previousPage = paginationFilter.PageNumber - 1 <= 0 ? 0 : paginationFilter.PageNumber - 1;
+            var totalRecords = await _context.dedupeConfigAudit.CountAsync();
+            var prevPage = pageRespDic["prevPage"];
+            var nextPage = pageRespDic["nextPage"];
+            System.Console.WriteLine("prevpage--->" + prevPage + nextPage);
+
+            var result = new PagedResponse<List<DedupeConfigAudit>>(
+                resp,
+                paginationFilter.PageNumber,
+                paginationFilter.PageSize,
+                prevPage,
+                nextPage,
+                totalRecords
+            );
+
+            return result;
+        }
+
+        public async Task<PagedResponse<List<DedupeNegativeListModel>>> getAllDedupeNegativeList(
+            PaginationFilter paginationFilter
+        )
+        {
+            var pageRespDic = _utilities.generateForPageURL(
+                paginationFilter.PageNumber,
+                paginationFilter.PageSize,
+                paginationFilter.applicationPath
+            );
+            var resp = await (
+                from dedupeNegativeListModel in _context.dedupeNegativeList
+                where
+                    dedupeNegativeListModel.isActive == true
+                    && dedupeNegativeListModel.isDeleted == false
+                select dedupeNegativeListModel
+            )
+                .Skip((paginationFilter.PageNumber - 1) * paginationFilter.PageSize)
+                .Take(paginationFilter.PageSize)
+                .ToListAsync();
+            // var previousPage = paginationFilter.PageNumber - 1 <= 0 ? 0 : paginationFilter.PageNumber - 1;
+            var totalRecords = await _context.dedupeNegativeList
+                .Where(d => d.isActive == true && d.isDeleted == false)
+                .CountAsync();
+            var prevPage = pageRespDic["prevPage"];
+            var nextPage = pageRespDic["nextPage"];
+            System.Console.WriteLine("prevpage--->" + prevPage + nextPage);
+
+            var result = new PagedResponse<List<DedupeNegativeListModel>>(
+                resp,
+                paginationFilter.PageNumber,
+                paginationFilter.PageSize,
+                prevPage,
+                nextPage,
+                totalRecords
+            );
+
+            return result;
+        }
+
+        public async Task<DedupeNegativeListModel> getByIdRbidata(int id)
+        {
+            var resp = await (
+                from dedupeNegativeList in _context.dedupeNegativeList
+                where
+                    dedupeNegativeList.dedupe_negative_list_id == id
+                    && dedupeNegativeList.isDeleted == false
+                select dedupeNegativeList
+            ).ToListAsync();
+            if (resp.Count > 0)
+            {
+                return resp[0];
+            }
+            else
+            {
+                throw new Exception();
+            }
+        }
+
+        public async Task<DedupeNegativeListModel> cretaeRbiData(
+            DedupeNegativeListModel model,
+            IFormFile file
+        )
+        {
+            var resp = await _context.dedupeNegativeList.AddAsync(model);
+            await _context.SaveChangesAsync();
+            var id = resp.Entity.dedupe_negative_list_id;
+
+            if (file != null && file.FileName != null)
+            {
+                var response = await uploadFile(id, file);
+                System.Console.WriteLine("response------->" + response);
+                var dmsPath = response["DmsPath"];
+                var dmsFileName = response["fileName"];
+
+                // Update the path and fileName of the inserted DedupeNegativeListModel
+                resp.Entity.s3BucketFilePath = dmsPath.ToString();
+                resp.Entity.fileName = file.FileName;
+                _context.dedupeNegativeList.Update(resp.Entity);
+                await _context.SaveChangesAsync();
+            }
+
+            return resp.Entity;
+        }
+
+        public async Task<DedupeNegativeListModel> updateRbidata(
+            DedupeNegativeListModel model,
+            IFormFile file
+        )
+        {
+            if (file != null && file.FileName != null)
+            {
+                var response = await uploadFile(model.dedupe_negative_list_id, file);
+                System.Console.WriteLine("response------->" + response);
+                var dmsPath = response["DmsPath"];
+                var dmsFileName = response["fileName"];
+
+                // Update the path and fileName of the inserted DedupeNegativeListModel
+                model.s3BucketFilePath = dmsPath.ToString();
+                model.fileName = file.FileName;
+            }
+            var resp = _context.dedupeNegativeList.Update(model);
+            _context.SaveChanges();
+            return resp.Entity;
+        }
+
+        private bool DedupeNegativeListModelExists(int id)
+        {
+            return _context.dedupeNegativeList.Any(e => e.dedupe_negative_list_id == id);
+        }
+
+        public DedupeNegativeListModel deleteDedupeNegativeList(int id)
+        {
+            DedupeNegativeListModel? dedupeNegativeListModel = _context.dedupeNegativeList.Find(id);
+            if (dedupeNegativeListModel != null)
+            {
+                dedupeNegativeListModel.isDeleted = true;
+                _context.dedupeNegativeList.Update(dedupeNegativeListModel);
+                _context.SaveChanges();
+                return dedupeNegativeListModel;
+            }
+            else
+            {
+                throw new Exception();
+            }
+        }
+
+        public async Task<Dictionary<string, object>> uploadFile(
+            int applicationNumber,
+            IFormFile file
+        )
+        {
+            using (var httpClient = new HttpClient())
+            {
+                System.Console.WriteLine(
+                    "application number --->" + applicationNumber + "------->" + file.FileName
+                );
+                var newFileName = (applicationNumber + "_" + file.FileName);
+                var requestUrl =
+                
+                    "https://localhost:7040/file/upload-with-file?path=All%2FDedupe&newFileName="
+                    + newFileName
+                    + "";
+
+                using (var requestContent = new MultipartFormDataContent())
+                {
+                    var fileBytes = await GetFileBytesAsync(file);
+                    var fileContent = new ByteArrayContent(fileBytes);
+                    fileContent.Headers.ContentType = MediaTypeHeaderValue.Parse(file.ContentType);
+
+                    requestContent.Add(fileContent, "file", file.FileName);
+
+                    var metadataContent = new StringContent(
+                        "{\"fileName\":\"" + newFileName + "\"}"
+                    );
+                    requestContent.Add(metadataContent, "metadata");
+
+                    using (var response = await httpClient.PostAsync(requestUrl, requestContent))
+                    {
+                        response.EnsureSuccessStatusCode();
+                        var responseContent = await response.Content.ReadAsStringAsync();
+                        // process responseContent as needed
+
+                        Dictionary<string, object> resp = new Dictionary<string, object>();
+                        resp.Add("DmsPath", "All/Dedupe" + "/" + newFileName);
+                        resp.Add("fileName", newFileName);
+                        return resp;
+                    }
+                }
+            }
+            throw new NotImplementedException();
+        }
+
+        private async Task<byte[]> GetFileBytesAsync(IFormFile file)
+        {
+            using (var memoryStream = new MemoryStream())
+            {
+                await file.CopyToAsync(memoryStream);
+
+                return memoryStream.ToArray();
+            }
+        }
+
+        public async Task<List<object>> getUniverseParameter()
+        {
+            var query =
+                from config in _context.fieldUniverseConfigModels
+                join universe in _context.fieldUniverseModels
+                    on config.FieldUniverseId equals universe.fieldUniverseId
+                where config.ConfigName == "dedupe" && config.isDeleted == false
+                select new
+                {
+                    universe.fieldUniverseId,
+                    config.FieldUniverseConfigId,
+                    universe.fieldUniverseKey
+                };
+
+            var result = await query.ToListAsync();
+            return result.Cast<object>().ToList();
+        }
+
+        public async Task<List<object>> getDedupeParameter()
+        {
+            var query =
+                from config in _context.fieldUniverseConfigModels
+                join universe in _context.fieldUniverseModels
+                    on config.FieldUniverseId equals universe.fieldUniverseId
+                where
+                    config.ConfigName == "dedupe"
+                    && config.isActive == true
+                    && config.isDeleted == false
+                select new
+                {
+                    universe.fieldUniverseId,
+                    config.FieldUniverseConfigId,
+                    universe.fieldUniverseKey
+                };
+
+            var result = await query.ToListAsync();
+            return result.Cast<object>().ToList();
+        }
+
+        public async Task<List<String>> getDedupeParameterforcode()
+        {
+            var query =
+                from config in _context.fieldUniverseConfigModels
+                join universe in _context.fieldUniverseModels
+                    on config.FieldUniverseId equals universe.fieldUniverseId
+                where
+                    config.ConfigName == "dedupe"
+                    && config.isActive == true
+                    && config.isDeleted == false
+                select universe.fieldUniverseKey;
+
+            var result = await query.ToListAsync();
+            return result;
+        }
+
+        public async Task<List<string>> getDedupeParameterAll()
+        {
+            var query =
+                from config in _context.fieldUniverseConfigModels
+                join universe in _context.fieldUniverseModels
+                    on config.FieldUniverseId equals universe.fieldUniverseId
+                where config.ConfigName == "dedupe" && config.isDeleted == false
+                select universe.fieldUniverseKey;
+
+            var result = await query.ToListAsync();
+            return result;
+        }
+
+        public async Task<Dictionary<string, object>> insertDataFromExcel(IFormFile file)
+        {
+            var resp = new Dictionary<string, object>();
+            if (file == null || file.Length <= 0)
+            {
+                resp.Add(
+                    "error",
+                    "The uploaded Excel file is empty. Please ensure it contains data."
+                );
+                return resp;
+            }
+
+            string fileExtension = Path.GetExtension(file.FileName);
+            if (fileExtension != ".xlsx" && fileExtension != ".xls")
+            {
+                resp.Add("error", "Invalid file format. Please upload a valid XLSX or XLS file");
+                return resp;
+            }
+
+            using var workbook = new XLWorkbook(file.OpenReadStream());
+            bool worksheetExists = workbook.Worksheets.Any(sheet => sheet.Name == "Sheet1");
+
+            if (!worksheetExists)
+            {
+                resp.Add("error", "Invalid worksheet name");
+                return resp;
+            }
+            var worksheet = workbook.Worksheet("Sheet1");
+            string[] expectedColumns =
+            {
+                "DateCautionAdvice",
+                "DateofReceiptCautionAdvice",
+                "CautionAdviceNo",
+                "NameofPerpetrators",
+                "PAN",
+                "NatureofRBICaution",
+                "AddedOn",
+                "Docsfileid",
+                "S3BucketFilePath",
+                "FileName",
+                "id"
+            };
+            for (int col = 1; col <= worksheet.ColumnCount(); col++)
+            {
+                string columnName = worksheet.Cell(1, col).Value.ToString();
+                if (!string.IsNullOrEmpty(columnName) && !expectedColumns.Contains(columnName))
+                {
+                    resp.Add(
+                        "error",
+                        "Invalid file format. The column names do not match the expected format"
+                    );
+                    return resp;
+                }
+            }
+            var validation = new Dictionary<string, object>();
+            var successData = new List<object>();
+            var failureData = new List<object>();
+
+            // Set the cell format to "Text" for the CIN column
+
+            List<DedupeNegativeListModel> dataList = new List<DedupeNegativeListModel>();
+            for (int row = 2; row <= worksheet.ColumnCount(); row++)
+            {
+                if (IsEmptyRow(worksheet, row) && HasDataInNextRow(worksheet, row))
+                {
+                    break;
+                }
+
+                var dateCautionAdviceStr = worksheet.Cell("A" + row)?.Value.ToString();
+                if (string.IsNullOrEmpty(dateCautionAdviceStr))
+                {
+                    break;
+                }
+                var errors = new List<string>();
+
+                var dateofReceiptCautionAdviceStr = worksheet.Cell(row, 2).Value.ToString();
+                var cautionAdviceNoStr = worksheet.Cell(row, 3).Value.ToString();
+                var nameofPerpetrators = worksheet.Cell(row, 4).Value.ToString();
+                var pan = worksheet.Cell("E" + row)?.Value.ToString();
+
+                var natureofRBICaution = worksheet.Cell(row, 6).Value.ToString();
+                var addedOnStr = worksheet.Cell(row, 7).Value.ToString();
+                var docsfileid = worksheet.Cell(row, 8).Value.ToString();
+                var s3BucketFilePath = worksheet.Cell(row, 9).Value.ToString();
+                var fileName = worksheet.Cell(row, 10).Value.ToString();
+                var id = worksheet.Cell(row, 11).Value.ToString();
+
+                System.Console.WriteLine(
+                    "dataaaa-->"
+                        + pan
+                        + "------>"
+                        + dateCautionAdviceStr
+                        + "------>"
+                        + dateofReceiptCautionAdviceStr
+                );
+                System.Console.WriteLine(
+                    "regex match----->" + Regex.IsMatch(pan, @"^[A-Z]{5}[0-9]{4}[A-Z]{1}$")
+                );
+                System.Console.WriteLine("length------>" + pan.Length);
+                if (
+                    string.IsNullOrEmpty(pan)
+                    || pan.Length != 10
+                    || !Regex.IsMatch(pan, @"^[A-Z]{5}[0-9]{4}[A-Z]{1}$")
+                )
+                {
+                    errors.Add("Invalid PAN format");
+                }
+                DateTime dateCautionAdvice;
+                string[] formats = { "yyyy-MM-dd", "MM/dd/yyyy", "dd/MM/yyyy" }; // Add more formats as needed
+
+                if (!DateTime.TryParse(dateCautionAdviceStr, out dateCautionAdvice))
+                {
+                    // Invalid date format or not a valid date
+                    errors.Add("Invalid date format or not a valid date in 'dateCautionAdvice'");
+                }
+
+                DateTime dateofReceiptCautionAdvice;
+                if (
+                    !DateTime.TryParse(
+                        dateofReceiptCautionAdviceStr,
+                        out dateofReceiptCautionAdvice
+                    )
+                )
+                {
+                    errors.Add("Invalid date format in 'dateofReceiptCautionAdvice'");
+                }
+
+                DateTime addedOn;
+                if (!DateTime.TryParse(addedOnStr, out addedOn))
+                {
+                    errors.Add("Invalid date format in 'addedOn' ");
+                }
+                if (string.IsNullOrEmpty(cautionAdviceNoStr))
+                {
+                    errors.Add("'cautionAdviceNo' value is null or empty ");
+                }
+
+                if (string.IsNullOrEmpty(nameofPerpetrators))
+                {
+                    errors.Add("'nameofPerpetrators' value is null or empty");
+                }
+
+                if (string.IsNullOrEmpty(docsfileid))
+                {
+                    errors.Add("docsfileid' value is null or empty ");
+                }
+
+                if (string.IsNullOrEmpty(s3BucketFilePath))
+                {
+                    errors.Add("'s3BucketFilePath' value is null or empty");
+                }
+
+                if (string.IsNullOrEmpty(fileName))
+                {
+                    errors.Add("'fileName' value is null or empty in");
+                }
+
+                if (string.IsNullOrEmpty(id))
+                {
+                    errors.Add("'id' value is null or empty in row ");
+                }
+                System.Console.WriteLine(
+                    "upload id is __________________________--------------" + id
+                );
+
+                if (errors.Count > 0)
+                {
+                    var failureRecord = new
+                    {
+                        dateCautionAdvice = dateCautionAdviceStr,
+                        dateofReceiptCautionAdvice = dateofReceiptCautionAdviceStr,
+                        cautionAdviceNo = cautionAdviceNoStr,
+                        nameofPerpetrators = nameofPerpetrators,
+                        pan = pan,
+                        natureofRBICaution = natureofRBICaution,
+                        addedOn = addedOnStr,
+                        docsfileid = int.Parse(docsfileid),
+                        s3BucketFilePath = s3BucketFilePath,
+                        fileName = fileName,
+                        id = id,
+                        errors = string.Join(", ", errors)
+                    };
+                    AddFailureRecord(failureRecord, failureData);
+                }
+                else
+                {
+                    var successRecord = new
+                    {
+                        dateCautionAdvice = Convert.ToDateTime(dateCautionAdviceStr),
+                        dateofReceiptCautionAdvice = Convert.ToDateTime(
+                            dateofReceiptCautionAdviceStr
+                        ),
+                        cautionAdviceNo = cautionAdviceNoStr,
+                        nameofPerpetrators = nameofPerpetrators,
+                        pan = pan,
+                        natureofRBICaution = natureofRBICaution,
+                        addedOn = Convert.ToDateTime(addedOnStr),
+                        docsfileid = int.Parse(docsfileid),
+                        s3BucketFilePath = s3BucketFilePath,
+                        fileName = fileName,
+                        id = id
+                    };
+                    successData.Add(successRecord);
+                }
+            }
+
+            // Populate the validation dictionary
+            validation.Add("isPartialUpload", false);
+            validation.Add("totalCount", successData.Count + failureData.Count);
+            validation.Add("successCount", successData.Count);
+            validation.Add("failureCount", failureData.Count);
+            validation.Add("success", new { data = successData });
+            validation.Add("failure", new { data = failureData });
+            System.Console.WriteLine("Check Conditionssss===>" + validation["totalCount"]);
+
+            addSuccesRecord(successData);
+            System.Console.WriteLine("validation");
+            return validation;
+        }
+
+        private void addSuccesRecord(List<object> successData)
+        {
+            List<DedupeNegativeListModel> dataList = new List<DedupeNegativeListModel>();
+            using var transaction = _context.Database.BeginTransaction();
+            try
+            {
+                foreach (var data1 in successData)
+                {
+                    var dateCautionAdviceStr = data1
+                        .GetType()
+                        .GetProperty("dateCautionAdvice")
+                        ?.GetValue(data1)
+                        ?.ToString();
+                    var dateofReceiptCautionAdviceStr = data1
+                        .GetType()
+                        .GetProperty("dateofReceiptCautionAdvice")
+                        ?.GetValue(data1)
+                        ?.ToString();
+                    var cautionAdviceNoStr = data1
+                        .GetType()
+                        .GetProperty("cautionAdviceNo")
+                        ?.GetValue(data1)
+                        ?.ToString();
+                    var nameofPerpetrators = data1
+                        .GetType()
+                        .GetProperty("nameofPerpetrators")
+                        ?.GetValue(data1)
+                        ?.ToString();
+                    var pan = data1.GetType().GetProperty("pan")?.GetValue(data1)?.ToString();
+
+                    var natureofRBICaution = data1
+                        .GetType()
+                        .GetProperty("natureofRBICaution")
+                        ?.GetValue(data1)
+                        ?.ToString();
+                    var addedOnStr = data1
+                        .GetType()
+                        .GetProperty("addedOn")
+                        ?.GetValue(data1)
+                        ?.ToString();
+                    var docsfileid = data1
+                        .GetType()
+                        .GetProperty("docsfileid")
+                        ?.GetValue(data1)
+                        ?.ToString();
+                    var s3BucketFilePath = data1
+                        .GetType()
+                        .GetProperty("s3BucketFilePath")
+                        ?.GetValue(data1)
+                        ?.ToString();
+                    var fileName = data1
+                        .GetType()
+                        .GetProperty("fileName")
+                        ?.GetValue(data1)
+                        ?.ToString();
+                    var id = data1.GetType().GetProperty("id")?.GetValue(data1)?.ToString();
+                    System.Console.WriteLine(
+                        "inside all the details here -----------"
+                            + id
+                            + ":::::::"
+                            + cautionAdviceNoStr
+                    );
+                    DedupeNegativeListModel data = new DedupeNegativeListModel()
+                    {
+                        dateCautionAdvice = Convert.ToDateTime(dateCautionAdviceStr),
+                        dateofReceiptCautionAdvice = Convert.ToDateTime(
+                            dateofReceiptCautionAdviceStr
+                        ),
+                        cautionAdviceNo = cautionAdviceNoStr,
+                        nameofPerpetrators = nameofPerpetrators,
+                        pan = pan,
+                        natureofRBICaution = natureofRBICaution,
+                        docsfileid = int.Parse(docsfileid),
+                        s3BucketFilePath = s3BucketFilePath,
+                        fileName = fileName,
+                        id = id
+                    };
+
+                    // Check if the PAN card already exists in the database
+                    var existingData = _context.dedupeNegativeList.FirstOrDefault(
+                        d => d.pan == pan
+                    );
+                    if (existingData != null)
+                    {
+                        // Update the existing record
+                        existingData.dateCautionAdvice = data.dateCautionAdvice;
+                        existingData.dateofReceiptCautionAdvice = data.dateofReceiptCautionAdvice;
+                        existingData.cautionAdviceNo = data.cautionAdviceNo;
+                        existingData.nameofPerpetrators = data.nameofPerpetrators;
+                        existingData.natureofRBICaution = data.natureofRBICaution;
+
+                        existingData.docsfileid = data.docsfileid;
+                        existingData.s3BucketFilePath = data.s3BucketFilePath;
+                        existingData.fileName = data.fileName;
+                        existingData.id = data.id;
+                    }
+                    else
+                    {
+                        // Insert a new record
+                        dataList.Add(data);
+                    }
+                }
+                if (dataList.Count > 0)
+                {
+                    _context.dedupeNegativeList.AddRange(dataList);
+                }
+
+                _context.SaveChanges();
+                transaction.Commit();
+            }
+            catch (Exception ex)
+            {
+                transaction.Rollback();
+                throw new InvalidOperationException("Failed to insert", ex);
+            }
+        }
+
+        private void AddFailureRecord(dynamic failureRecord, List<object> failureData)
+        {
+            // var existingFailureRecord = failureData.LastOrDefault() as dynamic;
+            // if (existingFailureRecord != null && existingFailureRecord.companyName == failureRecord.companyName)
+            // {
+            //     existingFailureRecord.errors = existingFailureRecord.errors + ", " + failureRecord.errors;
+            // }
+            // else
+            // {
+            failureData.Add(failureRecord);
+
+            // }
+        }
+
+        private bool IsEmptyRow(IXLWorksheet worksheet, int row)
+        {
+            int lastColumnIndex = worksheet.LastColumnUsed().ColumnNumber();
+            for (int col = 1; col <= lastColumnIndex; col++)
+            {
+                var cellValue = worksheet.Cell(row, col).Value;
+                if (!cellValue.IsBlank && !string.IsNullOrWhiteSpace(cellValue.ToString()))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private bool HasDataInNextRow(IXLWorksheet worksheet, int row)
+        {
+            int lastRowIndex = worksheet.LastRowUsed().RowNumber();
+            return row + 1 <= lastRowIndex && !IsEmptyRow(worksheet, row + 1);
+        }
+
+        public string getFieldname(int id)
+        {
+            var field = _context.fieldUniverseModels.FirstOrDefault(f => f.fieldUniverseId == id);
+            if (field != null)
+            {
+                return field.fieldUniverseKey;
+            }
+
+            return string.Empty;
+        }
+
+        public async Task<List<String>> getDedupeParameterActiveFieldName()
+        {
+            var query =
+                from config in _context.fieldUniverseConfigModels
+                join universe in _context.fieldUniverseModels
+                    on config.FieldUniverseId equals universe.fieldUniverseId
+                where
+                    config.ConfigName == "dedupe"
+                    && config.isActive == true
+                    && config.isDeleted == false
+                select universe.fieldUniverseKey;
+
+            var result = await query.ToListAsync();
+            return result;
+        }
+    }
+}
